@@ -17,21 +17,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/imroc/req/v3/internal/altsvcutil"
-	"github.com/imroc/req/v3/internal/ascii"
-	"github.com/imroc/req/v3/internal/common"
-	"github.com/imroc/req/v3/internal/dump"
-	"github.com/imroc/req/v3/internal/header"
-	"github.com/imroc/req/v3/internal/http2"
-	"github.com/imroc/req/v3/internal/http3"
-	"github.com/imroc/req/v3/internal/netutil"
-	"github.com/imroc/req/v3/internal/socks"
-	"github.com/imroc/req/v3/internal/transport"
-	"github.com/imroc/req/v3/internal/util"
-	"github.com/imroc/req/v3/pkg/altsvc"
-	reqtls "github.com/imroc/req/v3/pkg/tls"
-	htmlcharset "golang.org/x/net/html/charset"
-	"golang.org/x/text/encoding/ianaindex"
 	"io"
 	"log"
 	"mime"
@@ -45,6 +30,23 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/imroc/req/v3/internal/altsvcutil"
+	"github.com/imroc/req/v3/internal/ascii"
+	"github.com/imroc/req/v3/internal/common"
+	"github.com/imroc/req/v3/internal/dump"
+	"github.com/imroc/req/v3/internal/header"
+	"github.com/imroc/req/v3/internal/http2"
+	"github.com/imroc/req/v3/internal/http3"
+	"github.com/imroc/req/v3/internal/netutil"
+	"github.com/imroc/req/v3/internal/socks"
+	"github.com/imroc/req/v3/internal/transport"
+	"github.com/imroc/req/v3/internal/util"
+	"github.com/imroc/req/v3/pkg/altsvc"
+	reqtls "github.com/imroc/req/v3/pkg/tls"
+	utls "github.com/refraction-networking/utls"
+	htmlcharset "golang.org/x/net/html/charset"
+	"golang.org/x/text/encoding/ianaindex"
 
 	"golang.org/x/net/http/httpguts"
 )
@@ -1677,15 +1679,17 @@ func (t *Transport) decConnsPerHost(key connectMethodKey) {
 // The remote endpoint's name may be overridden by TLSClientConfig.ServerName.
 func (pc *persistConn) addTLS(ctx context.Context, name string, trace *httptrace.ClientTrace, forProxy bool) error {
 	// Initiate TLS and check remote host name against certificate.
-	cfg := cloneTLSConfig(pc.t.TLSClientConfig)
-	if cfg.ServerName == "" {
-		cfg.ServerName = name
-	}
-	if pc.cacheKey.onlyH1 {
-		cfg.NextProtos = nil
-	}
+	// cfg := cloneTLSConfig(pc.t.TLSClientConfig)
+	// if cfg.ServerName == "" {
+	// 	cfg.ServerName = name
+	// }
+	// if pc.cacheKey.onlyH1 {
+	// 	cfg.NextProtos = nil
+	// }
+	utlsConfig := &utls.Config{ServerName: name}
+
 	plainConn := pc.conn
-	tlsConn := tls.Client(plainConn, cfg)
+	tlsConn := utls.UClient(plainConn, utlsConfig, utls.HelloChrome_102)
 	errc := make(chan error, 2)
 	var timer *time.Timer // for canceling TLS handshake
 	if d := pc.t.TLSHandshakeTimeout; d != 0 {
@@ -1711,10 +1715,26 @@ func (pc *persistConn) addTLS(ctx context.Context, name string, trace *httptrace
 		return err
 	}
 	cs := tlsConn.ConnectionState()
-	if trace != nil && trace.TLSHandshakeDone != nil {
-		trace.TLSHandshakeDone(cs, nil)
+	// Partially convert tls.ConnectionState to utls.ConnectionState
+	// ekm cannot be set so a call to ExportKeyingMaterial will fail
+	utlsCs := tls.ConnectionState{
+		Version:                     cs.Version,
+		HandshakeComplete:           cs.HandshakeComplete,
+		DidResume:                   cs.DidResume,
+		CipherSuite:                 cs.CipherSuite,
+		NegotiatedProtocol:          cs.NegotiatedProtocol,
+		NegotiatedProtocolIsMutual:  cs.NegotiatedProtocolIsMutual,
+		ServerName:                  cs.ServerName,
+		SignedCertificateTimestamps: cs.SignedCertificateTimestamps,
+		PeerCertificates:            cs.PeerCertificates,
+		VerifiedChains:              cs.VerifiedChains,
+		OCSPResponse:                cs.OCSPResponse,
+		TLSUnique:                   cs.TLSUnique,
 	}
-	pc.tlsState = &cs
+	if trace != nil && trace.TLSHandshakeDone != nil {
+		trace.TLSHandshakeDone(tls.ConnectionState{}, nil)
+	}
+	pc.tlsState = &utlsCs
 	pc.conn = tlsConn
 	if !forProxy && pc.t.forceHttpVersion == h2 && cs.NegotiatedProtocol != http2.NextProtoTLS {
 		return newHttp2NotSupportedError(cs.NegotiatedProtocol)
